@@ -8,6 +8,15 @@ require('dotenv').config();
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 const Airtable = require('airtable'); // Ensure 'airtable' package is installed
+
+// Airtable configuration
+const AIRTABLE_API_KEY = 'patWE4usCxpkybDwn.2d02c7863cbf8498f1c52c977a441e3d47119b3aec068cb36889ed2d910c2da6';
+const AIRTABLE_BASE_ID = 'app1WKvRLMqf35PJh';
+
+// Initialize Airtable
+const airtable = new Airtable({ apiKey: AIRTABLE_API_KEY });
+const base = airtable.base(AIRTABLE_BASE_ID);
+
 // Enable CORS for all routes
 app.use(cors({
   origin: '*', // Allow all origins for development
@@ -22,6 +31,206 @@ let masterData = {
   currentInventory: new Map(),
   originalInventory: new Map() // Backup of original inventory
 };
+
+// Airtable sync functions
+async function syncProductsToAirtable(inventoryUpdates) {
+  console.log('🔄 Syncing products to Airtable...');
+  
+  try {
+    // Get existing products from Airtable
+    const existingProducts = {};
+    const records = await base('Products').select().all();
+    
+    records.forEach(record => {
+      existingProducts[record.get('MSKU')] = record.id;
+    });
+
+    const recordsToCreate = [];
+    const recordsToUpdate = [];
+
+    for (const item of inventoryUpdates) {
+      const inventoryData = masterData.currentInventory.get(item.msku);
+      
+      const productData = {
+        'MSKU': item.msku,
+        'Product Name': inventoryData?.productName || 'Unknown Product',
+        'Stock': item.newStock,
+        'Panel': item.panel || 'Unknown',
+        'Status': item.isOutOfStock ? 'Out of Stock' : 'Available'
+      };
+
+      if (existingProducts[item.msku]) {
+        // Update existing product
+        recordsToUpdate.push({
+          id: existingProducts[item.msku],
+          fields: productData
+        });
+      } else {
+        // Create new product
+        recordsToCreate.push({ fields: productData });
+      }
+    }
+
+    // Create new records in batches
+    if (recordsToCreate.length > 0) {
+      for (let i = 0; i < recordsToCreate.length; i += 10) {
+        const batch = recordsToCreate.slice(i, i + 10);
+        await base('Products').create(batch);
+        console.log(`✅ Created ${batch.length} new products in Airtable`);
+      }
+    }
+
+    // Update existing records in batches
+    if (recordsToUpdate.length > 0) {
+      for (let i = 0; i < recordsToUpdate.length; i += 10) {
+        const batch = recordsToUpdate.slice(i, i + 10);
+        await base('Products').update(batch);
+        console.log(`✅ Updated ${batch.length} products in Airtable`);
+      }
+    }
+
+    console.log(`🎉 Successfully synced ${recordsToCreate.length + recordsToUpdate.length} products to Airtable`);
+    return { created: recordsToCreate.length, updated: recordsToUpdate.length };
+
+  } catch (error) {
+    console.error('❌ Error syncing products to Airtable:', error);
+    throw error;
+  }
+}
+
+async function syncCombosToAirtable() {
+  console.log('🔄 Syncing combos to Airtable...');
+  
+  try {
+    // Get existing combos from Airtable
+    const existingCombos = {};
+    const records = await base('Combos').select().all();
+    
+    records.forEach(record => {
+      const comboSku = record.get('Combo SKU');
+      const componentMsku = record.get('Component MSKU');
+      if (comboSku && componentMsku) {
+        const key = `${comboSku}_${componentMsku}`;
+        existingCombos[key] = record.id;
+      }
+    });
+
+    // Get product records to link components
+    const productRecords = {};
+    const productData = await base('Products').select().all();
+    productData.forEach(record => {
+      productRecords[record.get('MSKU')] = record.id;
+    });
+
+    const recordsToCreate = [];
+
+    for (const [comboSku, components] of masterData.comboSkus) {
+      for (const component of components) {
+        const key = `${comboSku}_${component.msku}`;
+        
+        if (!existingCombos[key] && productRecords[component.msku]) {
+          recordsToCreate.push({
+            fields: {
+              'Combo SKU': comboSku,
+              'Component MSKU': [productRecords[component.msku]], // Link to Products table
+              'Component Quantity': component.quantity
+            }
+          });
+        }
+      }
+    }
+
+    // Create new combo records in batches
+    if (recordsToCreate.length > 0) {
+      for (let i = 0; i < recordsToCreate.length; i += 10) {
+        const batch = recordsToCreate.slice(i, i + 10);
+        await base('Combos').create(batch);
+        console.log(`✅ Created ${batch.length} combo components in Airtable`);
+      }
+    }
+
+    console.log(`🎉 Successfully synced ${recordsToCreate.length} combo components to Airtable`);
+    return { created: recordsToCreate.length };
+
+  } catch (error) {
+    console.error('❌ Error syncing combos to Airtable:', error);
+    throw error;
+  }
+}
+
+async function syncOrdersToAirtable(processedOrders) {
+  console.log('🔄 Syncing orders to Airtable...');
+  
+  try {
+    // Get product records to link orders
+    const productRecords = {};
+    const productData = await base('Products').select().all();
+    productData.forEach(record => {
+      productRecords[record.get('MSKU')] = record.id;
+    });
+
+    // Get existing orders to avoid duplicates
+    const existingOrders = new Set();
+    const orderRecords = await base('Orders').select().all();
+    orderRecords.forEach(record => {
+      const orderId = record.get('Order ID');
+      if (orderId) existingOrders.add(orderId);
+    });
+
+    const recordsToCreate = [];
+    const orderIdCounter = new Map(); // To ensure unique order IDs
+
+    for (const order of processedOrders) {
+      // Generate unique Order ID
+      const baseOrderId = `${order.marketplace}_${order.originalSku}_${order.orderDate || 'unknown'}`;
+      const count = orderIdCounter.get(baseOrderId) || 0;
+      orderIdCounter.set(baseOrderId, count + 1);
+      const orderId = count > 0 ? `${baseOrderId}_${count}` : baseOrderId;
+
+      if (!existingOrders.has(orderId) && productRecords[order.mappedMsku]) {
+        recordsToCreate.push({
+          fields: {
+            'Order ID': orderId,
+            'Marketplace': order.marketplace.toUpperCase(),
+            'SKU': order.originalSku,
+            'MSKU': [productRecords[order.mappedMsku]], // Link to Products table
+            'Quantity': order.quantity,
+            'Order Date': order.orderDate || new Date().toISOString().split('T')[0],
+            'Order Status': mapOrderStatus(order.status)
+          }
+        });
+      }
+    }
+
+    // Create new order records in batches
+    if (recordsToCreate.length > 0) {
+      for (let i = 0; i < recordsToCreate.length; i += 10) {
+        const batch = recordsToCreate.slice(i, i + 10);
+        await base('Orders').create(batch);
+        console.log(`✅ Created ${batch.length} orders in Airtable`);
+      }
+    }
+
+    console.log(`🎉 Successfully synced ${recordsToCreate.length} orders to Airtable`);
+    return { created: recordsToCreate.length };
+
+  } catch (error) {
+    console.error('❌ Error syncing orders to Airtable:', error);
+    throw error;
+  }
+}
+
+function mapOrderStatus(status) {
+  if (!status) return 'Pending';
+  
+  const statusLower = status.toString().toLowerCase();
+  
+  if (statusLower.includes('delivered')) return 'Delivered';
+  if (statusLower.includes('shipped') || statusLower.includes('dispatched')) return 'Shipped';
+  if (statusLower.includes('cancelled')) return 'Cancelled';
+  
+  return 'Pending';
+}
 
 // Load master data on startup
 async function loadMasterFilesOnStartup() {
@@ -493,7 +702,7 @@ function resetInventory() {
 // API Routes
 app.use(express.json());
 
-// Upload and process files
+// Upload and process files WITH AIRTABLE SYNC
 app.post('/process-orders', upload.fields([
   { name: 'masterFile', maxCount: 1 },
   { name: 'orderFiles', maxCount: 10 }
@@ -555,6 +764,42 @@ app.post('/process-orders', upload.fields([
     // Update inventory with sales
     const inventoryUpdates = updateInventoryWithSales(combinedMsquMap);
     
+    // 🚀 SYNC TO AIRTABLE
+    let airtableSync = {
+      products: { created: 0, updated: 0 },
+      combos: { created: 0 },
+      orders: { created: 0 },
+      error: null
+    };
+
+    try {
+      console.log('\n🔄 Starting Airtable sync...');
+      
+      // Sync products (inventory updates)
+      if (inventoryUpdates.length > 0) {
+        const productSync = await syncProductsToAirtable(inventoryUpdates);
+        airtableSync.products = productSync;
+      }
+      
+      // Sync combos if we have combo data
+      if (masterData.comboSkus.size > 0) {
+        const comboSync = await syncCombosToAirtable();
+        airtableSync.combos = comboSync;
+      }
+      
+      // Sync orders
+      if (allProcessedOrders.length > 0) {
+        const orderSync = await syncOrdersToAirtable(allProcessedOrders);
+        airtableSync.orders = orderSync;
+      }
+      
+      console.log('🎉 Airtable sync completed successfully!');
+      
+    } catch (airtableError) {
+      console.error('❌ Airtable sync failed:', airtableError);
+      airtableSync.error = airtableError.message;
+    }
+    
     // Generate summary
     const summary = {
       totalOrdersProcessed: allProcessedOrders.length,
@@ -579,7 +824,8 @@ app.post('/process-orders', upload.fields([
       inventoryUpdates,
       processedOrders: allProcessedOrders.slice(0, 100), // Limit for response size
       unmappedSkus: Array.from(allUnmappedSkus),
-      message: 'Orders processed successfully and inventory updated'
+      airtableSync, // Include Airtable sync results
+      message: `Orders processed successfully and inventory updated. ${airtableSync.error ? 'Airtable sync had errors.' : 'Data synced to Airtable!'}`
     });
     
   } catch (error) {
@@ -587,6 +833,57 @@ app.post('/process-orders', upload.fields([
     res.status(500).json({ 
       error: 'Failed to process files', 
       details: error.message 
+    });
+  }
+});
+
+// NEW: Manual Airtable sync endpoint
+app.post('/sync-to-airtable', async (req, res) => {
+  try {
+    console.log('🔄 Manual Airtable sync initiated...');
+    
+    let airtableSync = {
+      products: { created: 0, updated: 0 },
+      combos: { created: 0 },
+      orders: { created: 0 },
+      error: null
+    };
+
+    // Sync current inventory to products
+    const inventoryArray = Array.from(masterData.currentInventory.entries()).map(([msku, data]) => ({
+      msku: msku,
+      originalStock: data.originalStock,
+      soldQuantity: data.originalStock - data.currentStock,
+      newStock: data.currentStock,
+      stockReduced: data.originalStock - data.currentStock,
+      panel: data.panel,
+      status: data.status,
+      isOutOfStock: data.currentStock === 0
+    }));
+
+    if (inventoryArray.length > 0) {
+      const productSync = await syncProductsToAirtable(inventoryArray);
+      airtableSync.products = productSync;
+    }
+    
+    // Sync combos
+    if (masterData.comboSkus.size > 0) {
+      const comboSync = await syncCombosToAirtable();
+      airtableSync.combos = comboSync;
+    }
+    
+    res.json({
+      success: true,
+      message: 'Manual Airtable sync completed!',
+      airtableSync
+    });
+    
+  } catch (error) {
+    console.error('❌ Manual Airtable sync failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Manual Airtable sync failed',
+      details: error.message
     });
   }
 });
@@ -674,16 +971,9 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Test Airtable connection
 app.get('/test-airtable', async (req, res) => {
     try {
-        // Hardcoded Airtable API key and base ID
-        const apiKey = 'patWE4usCxpkybDwn.2d02c7863cbf8498f1c52c977a441e3d47119b3aec068cb36889ed2d910c2da6';
-        const baseId = 'app1WKvRLMqf35PJh';
-        
-        // Initialize Airtable with the hardcoded values
-        const airtable = new Airtable({ apiKey: apiKey });
-        const base = airtable.base(baseId);
-        
         // Fetch a few records from the 'Products' table as a test
         const records = await base('Products').select({ maxRecords: 3 }).firstPage();
         
@@ -692,7 +982,7 @@ app.get('/test-airtable', async (req, res) => {
             success: true,
             message: 'Airtable connection successful!',
             recordCount: records.length,
-            baseId: baseId
+            baseId: AIRTABLE_BASE_ID
         });
     } catch (error) {
         // Handle any errors
@@ -702,6 +992,7 @@ app.get('/test-airtable', async (req, res) => {
         });
     }
 });
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
@@ -714,15 +1005,19 @@ const PORT = process.env.PORT || 3000;
 loadMasterFilesOnStartup().then(() => {
   app.listen(PORT, () => {
     console.log(`WMS Backend server running on port ${PORT}`);
+    console.log('🚀 Airtable integration enabled!');
     console.log('CORS enabled for all origins');
     console.log('Available endpoints:');
-    console.log('  POST /process-orders     - Upload order CSVs and process inventory');
+    console.log('  POST /process-orders     - Upload order CSVs and process inventory (+ Airtable sync)');
+    console.log('  POST /sync-to-airtable   - Manually sync current data to Airtable');
     console.log('  POST /reset-inventory    - Reset inventory to original state');
     console.log('  GET  /mappings          - View SKU to MSKU mappings');
     console.log('  GET  /combos            - View combo SKU definitions');
     console.log('  GET  /inventory         - View current inventory status');
     console.log('  GET  /inventory-changes - View inventory changes after processing');
+    console.log('  GET  /test-airtable     - Test Airtable connection');
     console.log('  GET  /health            - Check server status');
+    console.log('\n📊 View your data at: https://airtable.com/app1WKvRLMqf35PJh/tblQ9vPx99R3rouEf/viwldOecEPA7sQoNh');
   });
 });
 
